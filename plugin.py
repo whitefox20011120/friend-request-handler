@@ -1,6 +1,6 @@
 """
 好友申请处理插件。
-by：白狐&claude
+by：白狐 & claude
 """
 
 from __future__ import annotations
