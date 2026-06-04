@@ -6,12 +6,14 @@ by：白狐 & claude
 from __future__ import annotations
 
 import asyncio
+import base64
 import hmac
 import json
 import os
 from hashlib import sha1
 from typing import Any, ClassVar, Dict, List, Optional
 
+import aiohttp
 from aiohttp import web
 
 from maibot_sdk import (
@@ -23,7 +25,9 @@ from maibot_sdk import (
 )
 
 
-# 配置区
+# ---------------- 配置模型 ----------------
+
+
 class PluginSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "插件设置"
     __ui_order__: ClassVar[int] = 0
@@ -76,27 +80,6 @@ class WebhookSection(PluginConfigBase):
     )
 
 
-class StartupSweepSection(PluginConfigBase):
-    __ui_label__: ClassVar[str] = "启动补漏"
-    __ui_order__: ClassVar[int] = 3
-
-    enabled: bool = Field(
-        default=True,
-        description="启动时拉一次 NapCat 系统消息，补上插件未运行期间漏掉的申请。",
-        json_schema_extra={"label": "启用启动补漏", "order": 0},
-    )
-    delay_sec: int = Field(
-        default=10, ge=0,
-        description="启动后等待多少秒再做补漏，给适配器留时间连接 NapCat。",
-        json_schema_extra={"label": "启动延迟（秒）", "order": 1, "step": 1},
-    )
-    fetch_count: int = Field(
-        default=20, ge=1, le=200,
-        description="单次最多拉取的申请数量。",
-        json_schema_extra={"label": "拉取数量", "order": 2, "step": 1},
-    )
-
-
 class WelcomeSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "欢迎语"
     __ui_order__: ClassVar[int] = 4
@@ -112,30 +95,48 @@ class WelcomeSection(PluginConfigBase):
         json_schema_extra={"label": "好友备注", "order": 1, "placeholder": "可留空"},
     )
 
+
+class NoticeSection(PluginConfigBase):
+    __ui_label__: ClassVar[str] = "申请通知"
+    __ui_order__: ClassVar[int] = 5
+
+    send_avatar: bool = Field(
+        default=True,
+        description="推送好友申请通知时，在文本上方附带申请方的 QQ 头像。",
+        json_schema_extra={"label": "附带头像", "order": 0},
+    )
+    avatar_size: int = Field(
+        default=640, ge=40, le=640,
+        description="头像尺寸（像素），常用值: 100/140/640。",
+        json_schema_extra={"label": "头像尺寸", "order": 1, "step": 1},
+    )
+
+
 class FriendRequestHandlerConfig(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     admin: AdminSection = Field(default_factory=AdminSection)
     webhook: WebhookSection = Field(default_factory=WebhookSection)
-    startup_sweep: StartupSweepSection = Field(default_factory=StartupSweepSection)
     welcome: WelcomeSection = Field(default_factory=WelcomeSection)
+    notice: NoticeSection = Field(default_factory=NoticeSection)
 
-# 插件主体
+
+# ---------------- 插件主体 ----------------
+
+
 class FriendRequestHandlerPlugin(MaiBotPlugin):
     config_model = FriendRequestHandlerConfig
 
     _runner: Optional[web.AppRunner]
     _site: Optional[web.BaseSite]
-    _sweep_task: Optional[asyncio.Task]
     # user_id(str) -> {"flag": str, "comment": str, "nickname": str}
     _pending: Dict[str, Dict[str, Any]]
-    # 已经推送过的 flag，避免 NapCat 重复推送或补漏重复打扰
+    # 已经推送过的 flag，避免 NapCat 重复推送
     _notified_flags: set
     _data_path: str
 
     async def on_load(self) -> None:
         self._runner = None
         self._site = None
-        self._sweep_task = None
         self._pending = {}
         self._notified_flags = set()
 
@@ -146,11 +147,9 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
 
         if self.config.plugin.enabled:
             await self._start_webhook()
-            self._schedule_startup_sweep()
         self.ctx.logger.info("好友申请处理插件已加载")
 
     async def on_unload(self) -> None:
-        await self._cancel_sweep()
         await self._stop_webhook()
         self._save_state()
 
@@ -160,13 +159,12 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         del config_data
         del version
 
-        await self._cancel_sweep()
         await self._stop_webhook()
         if self.config.plugin.enabled:
             await self._start_webhook()
-            self._schedule_startup_sweep()
 
-    # Webhook 服务
+    # ---------------- Webhook 服务 ----------------
+
     async def _start_webhook(self) -> None:
         webhook = self.config.webhook
         path = webhook.path if webhook.path.startswith("/") else f"/{webhook.path}"
@@ -256,103 +254,12 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
 
             notice_text = await self._build_notice_text(user_id, "", comment)
             for admin_qq in admin_qqs:
-                await self._send_private_text(admin_qq, notice_text)
+                await self._send_private_notice(admin_qq, user_id, notice_text)
             self.ctx.logger.info(f"已推送好友申请: user_id={user_id} flag={flag}")
         except Exception as exc:
             self.ctx.logger.warning(f"处理好友申请失败: {exc}")
 
-    # 启动补漏
-    def _schedule_startup_sweep(self) -> None:
-        if not self.config.startup_sweep.enabled:
-            return
-        self._sweep_task = asyncio.create_task(self._startup_sweep(), name="friend_request_handler.sweep")
-
-    async def _cancel_sweep(self) -> None:
-        task = self._sweep_task
-        self._sweep_task = None
-        if task is None or task.done():
-            return
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
-
-    async def _startup_sweep(self) -> None:
-        try:
-            await asyncio.sleep(max(0, int(self.config.startup_sweep.delay_sec)))
-            response = await self._call_napcat(
-                "get_friend_system_msg",
-                {"count": int(self.config.startup_sweep.fetch_count)},
-            )
-            if response is None:
-                return
-            invitations = self._extract_invitations(response)
-            admin_qqs = self._normalized_admin_qqs()
-            if not invitations or not admin_qqs:
-                return
-            for invitation in invitations:
-                user_id = self._extract_user_id(invitation)
-                flag = self._extract_flag(invitation)
-                if not user_id or not flag:
-                    continue
-                comment = str(
-                    invitation.get("comment")
-                    or invitation.get("reason")
-                    or invitation.get("message")
-                    or ""
-                ).strip()
-                nickname = str(invitation.get("nick") or invitation.get("nickname") or "").strip()
-                self._pending[user_id] = {"flag": flag, "comment": comment, "nickname": nickname}
-                if flag in self._notified_flags:
-                    continue
-                self._notified_flags.add(flag)
-                notice_text = await self._build_notice_text(user_id, nickname, comment)
-                for admin_qq in admin_qqs:
-                    await self._send_private_text(admin_qq, notice_text)
-            self._save_state()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self.ctx.logger.warning(f"启动补漏失败: {exc}")
-
-    # 资料组装
-    @staticmethod
-    def _extract_invitations(response: Any) -> List[Dict[str, Any]]:
-        if isinstance(response, dict):
-            data = response.get("data", response)
-        else:
-            data = response
-
-        if isinstance(data, list):
-            return [item for item in data if isinstance(item, dict)]
-        if not isinstance(data, dict):
-            return []
-
-        for key in ("invitationList", "InvitationList", "InvitedRequest", "join_list", "list"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return [item for item in value if isinstance(item, dict)]
-
-        if "request_id" in data or "flag" in data or "user_id" in data:
-            return [data]
-        return []
-
-    @staticmethod
-    def _extract_user_id(invitation: Dict[str, Any]) -> str:
-        for key in ("user_id", "userUid", "uin", "requesterUin", "from_uin", "fromUin"):
-            value = invitation.get(key)
-            if value not in (None, "", 0):
-                return str(value).strip()
-        return ""
-
-    @staticmethod
-    def _extract_flag(invitation: Dict[str, Any]) -> str:
-        for key in ("flag", "request_id", "requestId", "msg_seq", "msgSeq", "seq"):
-            value = invitation.get(key)
-            if value not in (None, "", 0):
-                return str(value).strip()
-        return ""
+    # ---------------- 资料组装 ----------------
 
     async def _build_notice_text(self, user_id: str, fallback_nickname: str, comment: str) -> str:
         info = await self._call_napcat(
@@ -415,7 +322,8 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         ]
         return " ".join([p for p in parts if p and p.lower() != "unknown"])
 
-    # 命令
+    # ---------------- 命令 ----------------
+
     @Command(
         "approve_friend",
         description="管理员同意指定 QQ 的好友申请",
@@ -480,7 +388,8 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             await self._reply(stream_id, f"已拒绝 QQ {target_qq} 的好友申请。")
         return True, None, True
 
-    # 辅助
+    # ---------------- 辅助 ----------------
+
     def _normalized_admin_qqs(self) -> List[str]:
         return [str(qq).strip() for qq in self.config.admin.admin_qqs if str(qq).strip()]
 
@@ -516,6 +425,53 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             raise_on_error=False,
         )
 
+    async def _send_private_notice(self, admin_qq: str, applicant_qq: str, text: str) -> None:
+        """给管理员推送好友申请通知，最上方附带申请方的 QQ 头像。"""
+        if not admin_qq or not text:
+            return
+
+        message: List[Dict[str, Any]] = []
+        if self.config.notice.send_avatar and applicant_qq:
+            size = int(self.config.notice.avatar_size or 640)
+            avatar_b64 = await self._fetch_avatar_base64(applicant_qq, size=size)
+            if avatar_b64:
+                message.append({"type": "image", "data": {"file": f"base64://{avatar_b64}"}})
+        message.append({"type": "text", "data": {"text": text}})
+
+        await self._call_napcat(
+            "send_private_msg",
+            {
+                "user_id": int(admin_qq) if str(admin_qq).isdigit() else admin_qq,
+                "message": message,
+            },
+            raise_on_error=False,
+        )
+
+    async def _fetch_avatar_base64(
+        self, qq: str, size: int = 640, timeout_sec: int = 10
+    ) -> Optional[str]:
+        """下载指定 QQ 的头像并返回 base64，失败返回 None。"""
+        urls = [
+            f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s={size}",
+            f"https://q.qlogo.cn/g?b=qq&nk={qq}&s={size}",
+        ]
+        timeout = aiohttp.ClientTimeout(total=timeout_sec)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                for url in urls:
+                    try:
+                        async with session.get(url) as resp:
+                            if resp.status == 200:
+                                data = await resp.read()
+                                if data:
+                                    return base64.b64encode(data).decode("utf-8")
+                    except Exception as exc:
+                        self.ctx.logger.debug(f"头像下载失败 {url}: {exc}")
+                        continue
+        except Exception as exc:
+            self.ctx.logger.warning(f"头像下载会话错误: {exc}")
+        return None
+
     async def _call_napcat(
         self,
         action_name: str,
@@ -541,7 +497,8 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             self.ctx.logger.debug(f"NapCat 动作 {action_name} 返回非 ok 状态: {error_text}")
         return response
 
-    # 持久化
+    # ---------------- 持久化 ----------------
+
     def _load_state(self) -> None:
         try:
             with open(self._data_path, "r", encoding="utf-8") as fp:
