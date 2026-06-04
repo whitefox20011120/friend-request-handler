@@ -223,7 +223,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         request_type = str(payload.get("request_type") or "").strip()
         if post_type == "request" and request_type == "friend":
             asyncio.create_task(self._on_friend_request(payload))
-        return web.Response(text="ok")
+        return web.json_response({})
 
     def _verify_signature(self, request: web.Request, raw: bytes) -> bool:
         secret = (self.config.webhook.secret or "").strip()
