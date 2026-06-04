@@ -1,12 +1,6 @@
-"""好友申请处理插件。
-
-功能：
-1. 在本地启动一个 HTTP 服务器接收 NapCat 推送的事件上报。
-2. 收到 ``post_type=request`` 且 ``request_type=friend`` 的事件时，向所有配置的管理员
-   QQ 私聊推送申请人 QQ 资料卡。
-3. 管理员发送 ``/同意 <QQ号>`` 或 ``/拒绝 <QQ号>`` 即可处理申请；通过后自动给新好友
-   发送配置的欢迎语。
-4. 启动后做一次补漏（轮询一次 NapCat 系统消息），避免插件未运行期间漏掉申请。
+"""
+好友申请处理插件。
+by：白狐&claude
 """
 
 from __future__ import annotations
@@ -29,9 +23,7 @@ from maibot_sdk import (
 )
 
 
-# ---------------- 配置模型 ----------------
-
-
+# 配置区
 class PluginSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "插件设置"
     __ui_order__: ClassVar[int] = 0
@@ -120,7 +112,6 @@ class WelcomeSection(PluginConfigBase):
         json_schema_extra={"label": "好友备注", "order": 1, "placeholder": "可留空"},
     )
 
-
 class FriendRequestHandlerConfig(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     admin: AdminSection = Field(default_factory=AdminSection)
@@ -128,10 +119,7 @@ class FriendRequestHandlerConfig(PluginConfigBase):
     startup_sweep: StartupSweepSection = Field(default_factory=StartupSweepSection)
     welcome: WelcomeSection = Field(default_factory=WelcomeSection)
 
-
-# ---------------- 插件主体 ----------------
-
-
+# 插件主体
 class FriendRequestHandlerPlugin(MaiBotPlugin):
     config_model = FriendRequestHandlerConfig
 
@@ -178,8 +166,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             await self._start_webhook()
             self._schedule_startup_sweep()
 
-    # ---------------- Webhook 服务 ----------------
-
+    # Webhook 服务
     async def _start_webhook(self) -> None:
         webhook = self.config.webhook
         path = webhook.path if webhook.path.startswith("/") else f"/{webhook.path}"
@@ -274,8 +261,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         except Exception as exc:
             self.ctx.logger.warning(f"处理好友申请失败: {exc}")
 
-    # ---------------- 启动补漏 ----------------
-
+    # 启动补漏
     def _schedule_startup_sweep(self) -> None:
         if not self.config.startup_sweep.enabled:
             return
@@ -330,8 +316,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         except Exception as exc:
             self.ctx.logger.warning(f"启动补漏失败: {exc}")
 
-    # ---------------- 资料组装 ----------------
-
+    # 资料组装
     @staticmethod
     def _extract_invitations(response: Any) -> List[Dict[str, Any]]:
         if isinstance(response, dict):
@@ -430,8 +415,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         ]
         return " ".join([p for p in parts if p and p.lower() != "unknown"])
 
-    # ---------------- 命令 ----------------
-
+    # 命令
     @Command(
         "approve_friend",
         description="管理员同意指定 QQ 的好友申请",
@@ -496,8 +480,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             await self._reply(stream_id, f"已拒绝 QQ {target_qq} 的好友申请。")
         return True, None, True
 
-    # ---------------- 辅助 ----------------
-
+    # 辅助
     def _normalized_admin_qqs(self) -> List[str]:
         return [str(qq).strip() for qq in self.config.admin.admin_qqs if str(qq).strip()]
 
@@ -558,8 +541,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             self.ctx.logger.debug(f"NapCat 动作 {action_name} 返回非 ok 状态: {error_text}")
         return response
 
-    # ---------------- 持久化 ----------------
-
+    # 持久化
     def _load_state(self) -> None:
         try:
             with open(self._data_path, "r", encoding="utf-8") as fp:
