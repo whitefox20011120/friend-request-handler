@@ -4,12 +4,12 @@
   "name": "好友申请处理",
   "description": "监听加好友申请，向管理员推送申请人 QQ 资料，并支持通过 /同意 命令一键通过验证并发送欢迎语",
   "author": {
-    "name": "your-name",
-    "url": "https://example.com"
+    "name": "白狐",
+    "url": "https://github.com/whitefox20011120"
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://example.com/your-repo"
+    "repository": "https://github.com/whitefox20011120/friend-request-handler"
   },
   "host_application": {
     "min_version": "1.0.0",
@@ -38,5 +38,5 @@
       "zh-CN"
     ]
   },
-  "id": "your-name.friend-request-handler"
+  "id": "whitefox.friend-request-handler"
 }
