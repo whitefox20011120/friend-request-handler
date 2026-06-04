@@ -24,10 +24,7 @@ from maibot_sdk import (
     PluginConfigBase,
 )
 
-
-# ---------------- 配置模型 ----------------
-
-
+# 配置模型
 class PluginSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "插件设置"
     __ui_order__: ClassVar[int] = 0
@@ -42,7 +39,6 @@ class PluginSection(PluginConfigBase):
         json_schema_extra={"disabled": True, "hidden": True, "label": "配置版本", "order": 99},
     )
 
-
 class AdminSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "管理员"
     __ui_order__: ClassVar[int] = 1
@@ -52,7 +48,6 @@ class AdminSection(PluginConfigBase):
         description="管理员 QQ 号列表；新好友申请会推送到这些 QQ，且只有他们能用 /同意 /拒绝。",
         json_schema_extra={"label": "管理员 QQ", "order": 0, "placeholder": "请输入 QQ 号"},
     )
-
 
 class WebhookSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "Webhook"
@@ -79,7 +74,6 @@ class WebhookSection(PluginConfigBase):
         json_schema_extra={"label": "Secret", "order": 3, "input_type": "password"},
     )
 
-
 class WelcomeSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "欢迎语"
     __ui_order__: ClassVar[int] = 4
@@ -94,7 +88,6 @@ class WelcomeSection(PluginConfigBase):
         description="通过申请时给新好友设置的备注，留空则不设置。",
         json_schema_extra={"label": "好友备注", "order": 1, "placeholder": "可留空"},
     )
-
 
 class NoticeSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "申请通知"
@@ -111,7 +104,6 @@ class NoticeSection(PluginConfigBase):
         json_schema_extra={"label": "头像尺寸", "order": 1, "step": 1},
     )
 
-
 class FriendRequestHandlerConfig(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     admin: AdminSection = Field(default_factory=AdminSection)
@@ -119,10 +111,7 @@ class FriendRequestHandlerConfig(PluginConfigBase):
     welcome: WelcomeSection = Field(default_factory=WelcomeSection)
     notice: NoticeSection = Field(default_factory=NoticeSection)
 
-
-# ---------------- 插件主体 ----------------
-
-
+# 插件主体
 class FriendRequestHandlerPlugin(MaiBotPlugin):
     config_model = FriendRequestHandlerConfig
 
@@ -163,8 +152,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         if self.config.plugin.enabled:
             await self._start_webhook()
 
-    # ---------------- Webhook 服务 ----------------
-
+    # Webhook 服务
     async def _start_webhook(self) -> None:
         webhook = self.config.webhook
         path = webhook.path if webhook.path.startswith("/") else f"/{webhook.path}"
@@ -259,8 +247,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         except Exception as exc:
             self.ctx.logger.warning(f"处理好友申请失败: {exc}")
 
-    # ---------------- 资料组装 ----------------
-
+    # 资料组装
     async def _build_notice_text(self, user_id: str, fallback_nickname: str, comment: str) -> str:
         info = await self._call_napcat(
             "get_stranger_info",
@@ -297,7 +284,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             lines.append(f"验证消息: {comment}")
 
         lines.append("")
-        lines.append(f"通过申请请发送：/同意 {user_id}")
+        lines.append(f"通过申请请发送：/同意 {user_id} [备注]")
         lines.append(f"拒绝申请请发送：/拒绝 {user_id}")
         return "\n".join(lines)
 
@@ -322,12 +309,11 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         ]
         return " ".join([p for p in parts if p and p.lower() != "unknown"])
 
-    # ---------------- 命令 ----------------
-
+    # 命令
     @Command(
         "approve_friend",
-        description="管理员同意指定 QQ 的好友申请",
-        pattern=r"^/同意\s+(?P<target_qq>\d+)\s*$",
+        description="管理员同意指定 QQ 的好友申请，可附带备注",
+        pattern=r"^/同意\s+(?P<target_qq>\d+)(?:\s+(?P<remark>.+?))?\s*$",
     )
     async def handle_approve(self, stream_id: str = "", **kwargs: Any) -> tuple:
         return await self._handle_decision(approve=True, stream_id=stream_id, **kwargs)
@@ -348,7 +334,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         matched_groups = kwargs.get("matched_groups") or {}
         target_qq = str(matched_groups.get("target_qq") or "").strip()
         if not target_qq:
-            return False, "用法：/同意 <QQ号> 或 /拒绝 <QQ号>", True
+            return False, "用法：/同意 <QQ号> [备注] 或 /拒绝 <QQ号>", True
 
         record = self._pending.get(target_qq)
         if record is None:
@@ -359,11 +345,12 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             return True, None, True
 
         flag = record.get("flag", "")
+        cmd_remark = str(matched_groups.get("remark") or "").strip() if approve else ""
+        remark = cmd_remark or (self.config.welcome.remark or "").strip()
+
         params: Dict[str, Any] = {"flag": flag, "approve": bool(approve)}
-        if approve:
-            remark = (self.config.welcome.remark or "").strip()
-            if remark:
-                params["remark"] = remark
+        if approve and remark:
+            params["remark"] = remark
 
         try:
             await self._call_napcat("set_friend_add_request", params, raise_on_error=True)
@@ -376,6 +363,17 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         self._save_state()
 
         if approve:
+            if cmd_remark:
+                await asyncio.sleep(0.5)
+                try:
+                    await self._call_napcat(
+                        "set_friend_remark",
+                        {"user_id": int(target_qq), "remark": cmd_remark},
+                        raise_on_error=False,
+                    )
+                except Exception as exc:
+                    self.ctx.logger.warning(f"设置好友备注失败: {exc}")
+
             await asyncio.sleep(1.0)
             welcome = (self.config.welcome.message or "").strip()
             if welcome:
@@ -383,13 +381,14 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
                     await self._send_private_text(target_qq, welcome)
                 except Exception as exc:
                     self.ctx.logger.warning(f"发送欢迎语失败: {exc}")
-            await self._reply(stream_id, f"已同意 QQ {target_qq} 的好友申请。")
+
+            remark_tip = f"（备注: {cmd_remark}）" if cmd_remark else ""
+            await self._reply(stream_id, f"已同意 QQ {target_qq} 的好友申请。{remark_tip}")
         else:
             await self._reply(stream_id, f"已拒绝 QQ {target_qq} 的好友申请。")
         return True, None, True
 
-    # ---------------- 辅助 ----------------
-
+    # 辅助
     def _normalized_admin_qqs(self) -> List[str]:
         return [str(qq).strip() for qq in self.config.admin.admin_qqs if str(qq).strip()]
 
@@ -497,8 +496,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             self.ctx.logger.debug(f"NapCat 动作 {action_name} 返回非 ok 状态: {error_text}")
         return response
 
-    # ---------------- 持久化 ----------------
-
+    # 持久化
     def _load_state(self) -> None:
         try:
             with open(self._data_path, "r", encoding="utf-8") as fp:
