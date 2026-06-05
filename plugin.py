@@ -336,6 +336,9 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         return await self._handle_decision(approve=False, stream_id=stream_id, **kwargs)
 
     async def _handle_decision(self, approve: bool, stream_id: str, **kwargs: Any) -> tuple:
+        if self._is_group_context(kwargs):
+            return False, None, False
+
         sender_qq = self._extract_sender_qq(kwargs)
         if sender_qq is None or sender_qq not in self._normalized_admin_qqs():
             return False, None, False
@@ -397,6 +400,14 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         return True, None, True
 
     # ---------------- 辅助 ----------------
+
+    @staticmethod
+    def _is_group_context(kwargs: Dict[str, Any]) -> bool:
+        base_info = kwargs.get("message_base_info") or {}
+        if isinstance(base_info, dict):
+            if base_info.get("group_id") or base_info.get("group_info"):
+                return True
+        return bool(kwargs.get("group_id"))
 
     def _normalized_admin_qqs(self) -> List[str]:
         return [str(qq).strip() for qq in self.config.admin.admin_qqs if str(qq).strip()]
