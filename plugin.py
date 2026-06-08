@@ -84,9 +84,9 @@ class WelcomeSection(PluginConfigBase):
     __ui_label__: ClassVar[str] = "欢迎语"
     __ui_order__: ClassVar[int] = 4
 
-    message: str = Field(
-        default="你好呀新朋友，欢迎认识我！",
-        description="通过好友申请后自动私聊给新好友的内容。",
+    messages: List[str] = Field(
+        default_factory=lambda: ["你好呀新朋友，欢迎认识我！"],
+        description="通过好友申请后自动私聊给新好友的内容，按顺序逐条发送。",
         json_schema_extra={"label": "欢迎语", "order": 0, "placeholder": "请输入欢迎语"},
     )
 
@@ -386,12 +386,14 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
                     self.ctx.logger.warning(f"设置好友备注失败: {exc}")
 
             await asyncio.sleep(1.0)
-            welcome = (self.config.welcome.message or "").strip()
-            if welcome:
+            messages = [m.strip() for m in (self.config.welcome.messages or []) if m.strip()]
+            for i, msg in enumerate(messages):
                 try:
-                    await self._send_private_text(target_qq, welcome)
+                    await self._send_private_text(target_qq, msg)
                 except Exception as exc:
                     self.ctx.logger.warning(f"发送欢迎语失败: {exc}")
+                if i < len(messages) - 1:
+                    await asyncio.sleep(0.5)
 
             remark_tip = f"（备注: {remark}）" if remark else ""
             await self._reply(stream_id, f"已同意 QQ {target_qq} 的好友申请。{remark_tip}")
