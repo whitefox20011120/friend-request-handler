@@ -38,5 +38,13 @@
       "zh-CN"
     ]
   },
-  "id": "whitefox.friend-request-handler"
+  "id": "whitefox.friend-request-handler",
+  "display": {
+    "icon": {
+      "type": "local",
+      "value": "assets/icon.svg",
+      "fallback": "image",
+      "background": "#ffffff"
+    }
+  }
 }
