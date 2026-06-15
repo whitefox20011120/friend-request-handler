@@ -14,7 +14,11 @@ LLM_PROMPT = (
     '否则回复"拒绝"，只需回复这两个词之一，不要附加其他内容。'
 )
 
-REMARK_TEMPLATE = "{nickname}"
+REMARK_PROMPT = (
+    '你是一个QQ好友备注生成助手。根据以下申请人信息（昵称、个性签名、验证消息等），'
+    '为对方生成一个简短自然的好友备注，不超过8个字，可以参考对方昵称或验证消息中体现的身份/称呼。'
+    '只回复备注本身，不要附加任何解释、引号或标点。'
+)
 
 
 async def handle_manual(plugin: "FriendRequestHandlerPlugin", user_id: str, flag: str, comment: str) -> None:
@@ -51,8 +55,9 @@ async def handle_llm_decision(plugin: "FriendRequestHandlerPlugin", user_id: str
     if approved:
         plugin.ctx.logger.info(f"LLM 判定通过好友申请: user_id={user_id}")
         if plugin.config.strategy.auto_remark:
-            nickname = await _get_nickname(plugin, user_id)
-            remark = REMARK_TEMPLATE.replace("{nickname}", nickname)
+            remark = await _generate_remark(plugin, info_text)
+            if not remark:
+                remark = await _get_nickname(plugin, user_id)
             if remark:
                 await asyncio.sleep(0.5)
                 try:
@@ -61,6 +66,7 @@ async def handle_llm_decision(plugin: "FriendRequestHandlerPlugin", user_id: str
                         {"user_id": int(user_id), "remark": remark},
                         raise_on_error=False,
                     )
+                    plugin.ctx.logger.info(f"已为 {user_id} 设置备注: {remark}")
                 except Exception as exc:
                     plugin.ctx.logger.warning(f"设置好友备注失败: {exc}")
         await _send_welcome(plugin, user_id)
@@ -102,6 +108,17 @@ async def _call_llm(plugin: "FriendRequestHandlerPlugin", prompt: str) -> tuple[
         plugin.ctx.logger.warning(f"LLM 返回失败: {result}")
         return False, ""
     return True, str(result.get("response", "")).strip()
+
+
+async def _generate_remark(plugin: "FriendRequestHandlerPlugin", info_text: str) -> str:
+    full_prompt = f"{REMARK_PROMPT}\n\n申请人信息：\n{info_text}"
+    ok, reply = await _call_llm(plugin, full_prompt)
+    if not ok:
+        return ""
+    remark = reply.strip().strip('"').strip("'").strip("「」").strip()
+    if len(remark) > 16:
+        remark = remark[:16]
+    return remark
 
 
 async def _get_nickname(plugin: "FriendRequestHandlerPlugin", user_id: str) -> str:

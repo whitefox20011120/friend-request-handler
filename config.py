@@ -113,7 +113,7 @@ class StrategySection(PluginConfigBase):
     auto_remark: bool = Field(
         default=True,
         json_schema_extra={
-            "hint": "仅 llm 模式生效。LLM 判定通过后自动将对方昵称设为好友备注。",
+            "hint": "仅 llm 模式生效。开启后，LLM 判定通过时会再调用一次 LLM 生成简短备注（失败则回退为对方昵称）。",
             "label": "自动设置备注",
             "order": 2,
         },
