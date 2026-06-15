@@ -11,133 +11,15 @@ import hmac
 import json
 import os
 from hashlib import sha1
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from aiohttp import web
 
-from maibot_sdk import (
-    CONFIG_RELOAD_SCOPE_SELF,
-    Command,
-    Field,
-    MaiBotPlugin,
-    PluginConfigBase,
-)
+from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, MaiBotPlugin
 
-
-# ---------------- 配置模型 ----------------
-
-
-class PluginSection(PluginConfigBase):
-    __ui_label__: ClassVar[str] = "插件设置"
-    __ui_order__: ClassVar[int] = 0
-
-    enabled: bool = Field(
-        default=True,
-        description="是否启用本插件。",
-        json_schema_extra={"label": "启用插件", "order": 0},
-    )
-    config_version: str = Field(
-        default="1.0.0",
-        json_schema_extra={"disabled": True, "hidden": True, "label": "配置版本", "order": 99},
-    )
-
-
-class AdminSection(PluginConfigBase):
-    __ui_label__: ClassVar[str] = "管理员"
-    __ui_order__: ClassVar[int] = 1
-
-    admin_qqs: List[str] = Field(
-        default_factory=list,
-        description="管理员 QQ 号列表；新好友申请会推送到这些 QQ，且只有他们能用 /同意 /拒绝。",
-        json_schema_extra={"label": "管理员 QQ", "order": 0, "placeholder": "请输入 QQ 号"},
-    )
-
-
-class WebhookSection(PluginConfigBase):
-    __ui_label__: ClassVar[str] = "Webhook"
-    __ui_order__: ClassVar[int] = 2
-
-    host: str = Field(
-        default="127.0.0.1",
-        description="监听 NapCat HTTP 上报的本地地址。",
-        json_schema_extra={"label": "监听地址", "order": 0, "placeholder": "127.0.0.1"},
-    )
-    port: int = Field(
-        default=18080, ge=1, le=65535,
-        description="监听端口，需要和 NapCat HTTP 客户端配置中的端口一致。",
-        json_schema_extra={"label": "监听端口", "order": 1, "step": 1},
-    )
-    path: str = Field(
-        default="/maibot/friend_request",
-        description="HTTP 路径，NapCat 的 URL 应填成 http://host:port/path。",
-        json_schema_extra={"label": "HTTP 路径", "order": 2, "placeholder": "/maibot/friend_request"},
-    )
-    secret: str = Field(
-        default="",
-        description="可选 secret，对应 NapCat 「HTTP 客户端」的 token，留空则不校验。",
-        json_schema_extra={"label": "Secret", "order": 3, "input_type": "password"},
-    )
-
-
-class WelcomeSection(PluginConfigBase):
-    __ui_label__: ClassVar[str] = "欢迎语"
-    __ui_order__: ClassVar[int] = 4
-
-    messages: List[str] = Field(
-        default_factory=lambda: ["你好呀新朋友，欢迎认识我！"],
-        description="通过好友申请后自动私聊给新好友的内容，按顺序逐条发送。",
-        json_schema_extra={"label": "欢迎语", "order": 0, "placeholder": "请输入欢迎语"},
-    )
-
-
-class NoticeSection(PluginConfigBase):
-    __ui_label__: ClassVar[str] = "申请通知"
-    __ui_order__: ClassVar[int] = 5
-
-    send_avatar: bool = Field(
-        default=True,
-        description="推送好友申请通知时，在文本上方附带申请方的 QQ 头像。",
-        json_schema_extra={"label": "附带头像", "order": 0},
-    )
-    avatar_size: int = Field(
-        default=640, ge=40, le=640,
-        description="头像尺寸（像素），常用值: 100/140/640。",
-        json_schema_extra={"label": "头像尺寸", "order": 1, "step": 1},
-    )
-
-
-class StrategySection(PluginConfigBase):
-    __ui_label__: ClassVar[str] = "申请处理策略"
-    __ui_order__: ClassVar[int] = 3
-
-    mode: str = Field(
-        default="manual",
-        description="好友申请处理策略：manual（手动审批）/ llm（LLM 自动判定）/ auto_approve（无条件自动通过）。",
-        json_schema_extra={"label": "处理策略", "order": 0, "placeholder": "manual"},
-    )
-    model_name: str = Field(
-        default="",
-        description="LLM 模型名称，仅 mode=llm 时生效；留空则使用默认模型。",
-        json_schema_extra={"label": "LLM 模型", "order": 1, "placeholder": "留空使用默认"},
-    )
-    auto_remark: bool = Field(
-        default=True,
-        description="LLM 通过后是否自动设置好友备注，仅 mode=llm 时生效。",
-        json_schema_extra={"label": "自动备注", "order": 2},
-    )
-
-
-class FriendRequestHandlerConfig(PluginConfigBase):
-    plugin: PluginSection = Field(default_factory=PluginSection)
-    admin: AdminSection = Field(default_factory=AdminSection)
-    webhook: WebhookSection = Field(default_factory=WebhookSection)
-    strategy: StrategySection = Field(default_factory=StrategySection)
-    welcome: WelcomeSection = Field(default_factory=WelcomeSection)
-    notice: NoticeSection = Field(default_factory=NoticeSection)
-
-
-# ---------------- 插件主体 ----------------
+from .config import FriendRequestHandlerConfig
+from .handlers import handle_auto_approve, handle_llm_decision, handle_manual
 
 
 class FriendRequestHandlerPlugin(MaiBotPlugin):
@@ -145,18 +27,9 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
 
     _runner: Optional[web.AppRunner]
     _site: Optional[web.BaseSite]
-    # user_id(str) -> {"flag": str, "comment": str, "nickname": str}
     _pending: Dict[str, Dict[str, Any]]
-    # 已经推送过的 flag，避免 NapCat 重复推送
     _notified_flags: set
     _data_path: str
-
-    _LLM_PROMPT = (
-        '你是一个QQ好友申请审核助手。根据以下申请人信息，判断对方是否为正常用户'
-        '（非广告号、非小号、非恶意用户）。如果判断为安全用户请回复"通过"，'
-        '否则回复"拒绝"，只需回复这两个词之一，不要附加其他内容。'
-    )
-    _REMARK_TEMPLATE = "{nickname}"
 
     async def on_load(self) -> None:
         self._runner = None
@@ -180,14 +53,12 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
     async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
-        del config_data
-        del version
-
+        del config_data, version
         await self._stop_webhook()
         if self.config.plugin.enabled:
             await self._start_webhook()
 
-    # ---------------- Webhook 服务 ----------------
+    # ---- Webhook 服务 ----
 
     async def _start_webhook(self) -> None:
         webhook = self.config.webhook
@@ -208,15 +79,11 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             await self._stop_webhook()
             return
 
-        self.ctx.logger.info(
-            f"好友申请 webhook 已监听: http://{webhook.host}:{webhook.port}{path}"
-        )
+        self.ctx.logger.info(f"好友申请 webhook 已监听: http://{webhook.host}:{webhook.port}{path}")
 
     async def _stop_webhook(self) -> None:
-        site = self._site
-        runner = self._runner
-        self._site = None
-        self._runner = None
+        site, runner = self._site, self._runner
+        self._site = self._runner = None
         try:
             if site is not None:
                 await site.stop()
@@ -232,12 +99,10 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         raw = await request.read()
         if not self._verify_signature(request, raw):
             return web.Response(status=401, text="invalid signature")
-
         try:
             payload = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
             return web.Response(status=400, text="invalid json")
-
         if not isinstance(payload, dict):
             return web.Response(status=400, text="invalid payload")
 
@@ -257,6 +122,8 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         expected = "sha1=" + hmac.new(secret.encode("utf-8"), raw, sha1).hexdigest()
         return hmac.compare_digest(signature, expected)
 
+    # ---- 申请分流 ----
+
     async def _on_friend_request(self, payload: Dict[str, Any]) -> None:
         try:
             user_id = str(payload.get("user_id") or "").strip()
@@ -264,246 +131,23 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             comment = str(payload.get("comment") or "").strip()
             if not user_id or not flag:
                 return
-
             if flag in self._notified_flags:
                 return
             self._notified_flags.add(flag)
 
             mode = (self.config.strategy.mode or "manual").strip().lower()
-
             if mode == "llm":
-                await self._handle_llm_decision(user_id, flag, comment)
+                await handle_llm_decision(self, user_id, flag, comment)
             elif mode == "auto_approve":
-                await self._handle_auto_approve(user_id, flag, comment)
+                await handle_auto_approve(self, user_id, flag, comment)
             else:
-                await self._handle_manual(user_id, flag, comment)
+                await handle_manual(self, user_id, flag, comment)
 
             self._save_state()
         except Exception as exc:
             self.ctx.logger.warning(f"处理好友申请失败: {exc}")
 
-    async def _handle_manual(self, user_id: str, flag: str, comment: str) -> None:
-        admin_qqs = self._normalized_admin_qqs()
-        if not admin_qqs:
-            self.ctx.logger.warning("收到好友申请但未配置 admin_qqs，无法推送")
-            return
-
-        self._pending[user_id] = {"flag": flag, "comment": comment, "nickname": ""}
-
-        notice_text = await self._build_notice_text(user_id, "", comment)
-        for admin_qq in admin_qqs:
-            await self._send_private_notice(admin_qq, user_id, notice_text)
-        self.ctx.logger.info(f"已推送好友申请: user_id={user_id} flag={flag}")
-
-    async def _handle_llm_decision(self, user_id: str, flag: str, comment: str) -> None:
-        info_text = await self._build_applicant_info_text(user_id, comment)
-        full_prompt = f"{self._LLM_PROMPT}\n\n申请人信息：\n{info_text}"
-
-        ok, reply = await self._call_llm(full_prompt)
-        if not ok:
-            self.ctx.logger.warning(f"LLM 调用失败，回退到手动模式: user_id={user_id}")
-            await self._handle_manual(user_id, flag, comment)
-            return
-
-        approved = "通过" in reply
-        await self._call_napcat(
-            "set_friend_add_request",
-            {"flag": flag, "approve": approved},
-            raise_on_error=False,
-        )
-
-        if approved:
-            self.ctx.logger.info(f"LLM 判定通过好友申请: user_id={user_id}")
-            if self.config.strategy.auto_remark:
-                nickname = await self._get_nickname(user_id)
-                remark = self._REMARK_TEMPLATE.replace("{nickname}", nickname)
-                if remark:
-                    await asyncio.sleep(0.5)
-                    try:
-                        await self._call_napcat(
-                            "set_friend_remark",
-                            {"user_id": int(user_id), "remark": remark},
-                            raise_on_error=False,
-                        )
-                    except Exception as exc:
-                        self.ctx.logger.warning(f"设置好友备注失败: {exc}")
-            await self._send_welcome(user_id)
-        else:
-            self.ctx.logger.info(f"LLM 判定拒绝好友申请: user_id={user_id}")
-
-    async def _handle_auto_approve(self, user_id: str, flag: str, comment: str) -> None:
-        await self._call_napcat(
-            "set_friend_add_request",
-            {"flag": flag, "approve": True},
-            raise_on_error=False,
-        )
-        self.ctx.logger.info(f"自动通过好友申请: user_id={user_id}")
-
-        admin_qqs = self._normalized_admin_qqs()
-        if admin_qqs:
-            info_text = await self._build_info_only_text(user_id, comment)
-            for admin_qq in admin_qqs:
-                await self._send_private_notice(admin_qq, user_id, info_text)
-
-        await self._send_welcome(user_id)
-
-    # ---------------- LLM / 自动策略辅助 ----------------
-
-    async def _call_llm(self, prompt: str) -> tuple[bool, str]:
-        model_name = (self.config.strategy.model_name or "").strip()
-        try:
-            kwargs: Dict[str, Any] = {"prompt": prompt, "temperature": 0.3, "max_tokens": 64}
-            if model_name:
-                kwargs["model"] = model_name
-            result = await self.ctx.llm.generate(**kwargs)
-        except Exception as e:
-            self.ctx.logger.error(f"LLM 调用异常: {e}", exc_info=True)
-            return False, ""
-        if not isinstance(result, dict) or not result.get("success"):
-            self.ctx.logger.warning(f"LLM 返回失败: {result}")
-            return False, ""
-        return True, str(result.get("response", "")).strip()
-
-    async def _get_nickname(self, user_id: str) -> str:
-        info = await self._call_napcat(
-            "get_stranger_info",
-            {"user_id": int(user_id) if user_id.isdigit() else user_id, "no_cache": True},
-        )
-        info_data = info.get("data", info) if isinstance(info, dict) else {}
-        if not isinstance(info_data, dict):
-            return ""
-        return str(info_data.get("nickname") or "").strip()
-
-    async def _send_welcome(self, user_id: str) -> None:
-        await asyncio.sleep(1.0)
-        messages = [m.strip() for m in (self.config.welcome.messages or []) if m.strip()]
-        for i, msg in enumerate(messages):
-            try:
-                await self._send_private_text(user_id, msg)
-            except Exception as exc:
-                self.ctx.logger.warning(f"发送欢迎语失败: {exc}")
-            if i < len(messages) - 1:
-                await asyncio.sleep(0.5)
-
-    async def _build_applicant_info_text(self, user_id: str, comment: str) -> str:
-        info = await self._call_napcat(
-            "get_stranger_info",
-            {"user_id": int(user_id) if user_id.isdigit() else user_id, "no_cache": True},
-        )
-        info_data = info.get("data", info) if isinstance(info, dict) else {}
-        if not isinstance(info_data, dict):
-            info_data = {}
-
-        lines: List[str] = []
-
-        def add(label: str, value: Any) -> None:
-            text = "" if value is None else str(value).strip()
-            if not text or text in {"0", "0.0", "unknown"}:
-                return
-            lines.append(f"{label}: {text}")
-
-        add("QQ号", user_id)
-        add("昵称", info_data.get("nickname"))
-        add("性别", self._format_sex(info_data.get("sex")))
-        add("年龄", info_data.get("age"))
-        add("等级", info_data.get("level") or info_data.get("qqLevel"))
-        add("个性签名", info_data.get("long_nick") or info_data.get("longNick") or info_data.get("sign"))
-        add("登录天数", info_data.get("login_days") or info_data.get("loginDays"))
-        if comment:
-            lines.append(f"验证消息: {comment}")
-        return "\n".join(lines)
-
-    async def _build_info_only_text(self, user_id: str, comment: str) -> str:
-        info = await self._call_napcat(
-            "get_stranger_info",
-            {"user_id": int(user_id) if user_id.isdigit() else user_id, "no_cache": True},
-        )
-        info_data = info.get("data", info) if isinstance(info, dict) else {}
-        if not isinstance(info_data, dict):
-            info_data = {}
-
-        lines: List[str] = ["✅ 已自动通过好友申请"]
-
-        def add(label: str, value: Any) -> None:
-            text = "" if value is None else str(value).strip()
-            if not text or text in {"0", "0.0", "unknown"}:
-                return
-            lines.append(f"{label}: {text}")
-
-        add("QQ号", user_id)
-        add("昵称", info_data.get("nickname"))
-        add("性别", self._format_sex(info_data.get("sex")))
-        add("年龄", info_data.get("age"))
-        add("等级", info_data.get("level") or info_data.get("qqLevel"))
-        add("个性签名", info_data.get("long_nick") or info_data.get("longNick") or info_data.get("sign"))
-        if comment:
-            lines.append(f"验证消息: {comment}")
-        return "\n".join(lines)
-
-    # ---------------- 资料组装 ----------------
-
-    async def _build_notice_text(self, user_id: str, fallback_nickname: str, comment: str) -> str:
-        info = await self._call_napcat(
-            "get_stranger_info",
-            {"user_id": int(user_id) if user_id.isdigit() else user_id, "no_cache": True},
-        )
-        info_data = info.get("data", info) if isinstance(info, dict) else info
-        if not isinstance(info_data, dict):
-            info_data = {}
-
-        lines: List[str] = ["📩 收到新的好友申请"]
-
-        def add(label: str, value: Any) -> None:
-            text = "" if value is None else str(value).strip()
-            if not text or text in {"0", "0.0", "unknown"}:
-                return
-            lines.append(f"{label}: {text}")
-
-        nickname = str(info_data.get("nickname") or fallback_nickname or "").strip()
-        add("QQ号", user_id)
-        add("昵称", nickname)
-        add("性别", self._format_sex(info_data.get("sex")))
-        add("年龄", info_data.get("age"))
-        add("等级", info_data.get("level") or info_data.get("qqLevel"))
-        add("生日", self._format_birthday(info_data))
-        add("所在地", self._format_location(info_data))
-        add("国家", info_data.get("country"))
-        add("学校", info_data.get("school") or info_data.get("eduInfo"))
-        add("个性签名", info_data.get("long_nick") or info_data.get("longNick") or info_data.get("sign"))
-        add("邮箱", info_data.get("email"))
-        add("电话", info_data.get("phoneNum") or info_data.get("phone"))
-        add("vip等级", info_data.get("vip_level") or info_data.get("vipLevel"))
-        add("登录天数", info_data.get("login_days") or info_data.get("loginDays"))
-        if comment:
-            lines.append(f"验证消息: {comment}")
-
-        lines.append("")
-        lines.append(f"通过申请请发送：/同意 {user_id} [备注]")
-        lines.append(f"拒绝申请请发送：/拒绝 {user_id}")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _format_sex(value: Any) -> str:
-        text = str(value or "").strip().lower()
-        return {"male": "男", "female": "女", "0": "男", "1": "女"}.get(text, "")
-
-    @staticmethod
-    def _format_birthday(info: Dict[str, Any]) -> str:
-        year = info.get("birthday_year") or info.get("birthdayYear") or info.get("year")
-        month = info.get("birthday_month") or info.get("birthdayMonth") or info.get("month")
-        day = info.get("birthday_day") or info.get("birthdayDay") or info.get("day")
-        parts = [str(p).strip() for p in (year, month, day) if p not in (None, "", 0, "0")]
-        return "-".join(parts)
-
-    @staticmethod
-    def _format_location(info: Dict[str, Any]) -> str:
-        parts = [
-            str(info.get(key) or "").strip()
-            for key in ("country", "province", "city", "area")
-        ]
-        return " ".join([p for p in parts if p and p.lower() != "unknown"])
-
-    # ---------------- 命令 ----------------
+    # ---- 命令 ----
 
     @Command(
         "approve_friend",
@@ -521,10 +165,11 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
     async def handle_reject(self, stream_id: str = "", **kwargs: Any) -> tuple:
         return await self._handle_decision(approve=False, stream_id=stream_id, **kwargs)
 
+    # --- PLACEHOLDER_DECISION ---
+
     async def _handle_decision(self, approve: bool, stream_id: str, **kwargs: Any) -> tuple:
         if self._is_group_context(kwargs):
             return False, None, False
-
         sender_qq = self._extract_sender_qq(kwargs)
         if sender_qq is None or sender_qq not in self._normalized_admin_qqs():
             return False, None, False
@@ -536,10 +181,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
 
         record = self._pending.get(target_qq)
         if record is None:
-            await self._reply(
-                stream_id,
-                f"未找到 QQ {target_qq} 的好友申请，可能已经处理过或 webhook 未收到。",
-            )
+            await self._reply(stream_id, f"未找到 QQ {target_qq} 的好友申请，可能已经处理过或 webhook 未收到。")
             return True, None, True
 
         flag = record.get("flag", "")
@@ -563,31 +205,23 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             if remark:
                 await asyncio.sleep(0.5)
                 try:
-                    await self._call_napcat(
-                        "set_friend_remark",
-                        {"user_id": int(target_qq), "remark": remark},
-                        raise_on_error=False,
-                    )
+                    await self._call_napcat("set_friend_remark", {"user_id": int(target_qq), "remark": remark}, raise_on_error=False)
                 except Exception as exc:
                     self.ctx.logger.warning(f"设置好友备注失败: {exc}")
-
             await asyncio.sleep(1.0)
-            messages = [m.strip() for m in (self.config.welcome.messages or []) if m.strip()]
-            for i, msg in enumerate(messages):
+            for msg in [m.strip() for m in (self.config.welcome.messages or []) if m.strip()]:
                 try:
                     await self._send_private_text(target_qq, msg)
                 except Exception as exc:
                     self.ctx.logger.warning(f"发送欢迎语失败: {exc}")
-                if i < len(messages) - 1:
-                    await asyncio.sleep(0.5)
-
+                await asyncio.sleep(0.5)
             remark_tip = f"（备注: {remark}）" if remark else ""
             await self._reply(stream_id, f"已同意 QQ {target_qq} 的好友申请。{remark_tip}")
         else:
             await self._reply(stream_id, f"已拒绝 QQ {target_qq} 的好友申请。")
         return True, None, True
 
-    # ---------------- 辅助 ----------------
+    # ---- 工具方法 ----
 
     @staticmethod
     def _is_group_context(kwargs: Dict[str, Any]) -> bool:
@@ -604,10 +238,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
     def _extract_sender_qq(kwargs: Dict[str, Any]) -> Optional[str]:
         base_info = kwargs.get("message_base_info") or {}
         user_info = base_info.get("user_info") if isinstance(base_info, dict) else {}
-        sender_qq = (
-            kwargs.get("user_id")
-            or (user_info.get("user_id") if isinstance(user_info, dict) else None)
-        )
+        sender_qq = kwargs.get("user_id") or (user_info.get("user_id") if isinstance(user_info, dict) else None)
         if sender_qq in (None, ""):
             return None
         return str(sender_qq).strip()
@@ -625,18 +256,13 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             return
         await self._call_napcat(
             "send_private_msg",
-            {
-                "user_id": int(user_id) if str(user_id).isdigit() else user_id,
-                "message": [{"type": "text", "data": {"text": text}}],
-            },
+            {"user_id": int(user_id) if str(user_id).isdigit() else user_id, "message": [{"type": "text", "data": {"text": text}}]},
             raise_on_error=False,
         )
 
     async def _send_private_notice(self, admin_qq: str, applicant_qq: str, text: str) -> None:
-        """给管理员推送好友申请通知，最上方附带申请方的 QQ 头像。"""
         if not admin_qq or not text:
             return
-
         message: List[Dict[str, Any]] = []
         if self.config.notice.send_avatar and applicant_qq:
             size = int(self.config.notice.avatar_size or 640)
@@ -644,20 +270,13 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             if avatar_b64:
                 message.append({"type": "image", "data": {"file": f"base64://{avatar_b64}"}})
         message.append({"type": "text", "data": {"text": text}})
-
         await self._call_napcat(
             "send_private_msg",
-            {
-                "user_id": int(admin_qq) if str(admin_qq).isdigit() else admin_qq,
-                "message": message,
-            },
+            {"user_id": int(admin_qq) if str(admin_qq).isdigit() else admin_qq, "message": message},
             raise_on_error=False,
         )
 
-    async def _fetch_avatar_base64(
-        self, qq: str, size: int = 640, timeout_sec: int = 10
-    ) -> Optional[str]:
-        """下载指定 QQ 的头像并返回 base64，失败返回 None。"""
+    async def _fetch_avatar_base64(self, qq: str, size: int = 640, timeout_sec: int = 10) -> Optional[str]:
         urls = [
             f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s={size}",
             f"https://q.qlogo.cn/g?b=qq&nk={qq}&s={size}",
@@ -674,29 +293,18 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
                                     return base64.b64encode(data).decode("utf-8")
                     except Exception as exc:
                         self.ctx.logger.debug(f"头像下载失败 {url}: {exc}")
-                        continue
         except Exception as exc:
             self.ctx.logger.warning(f"头像下载会话错误: {exc}")
         return None
 
-    async def _call_napcat(
-        self,
-        action_name: str,
-        params: Dict[str, Any],
-        raise_on_error: bool = False,
-    ) -> Any:
+    async def _call_napcat(self, action_name: str, params: Dict[str, Any], raise_on_error: bool = False) -> Any:
         try:
-            response = await self.ctx.api.call(
-                "adapter.napcat.action.call",
-                action_name=action_name,
-                params=params,
-            )
+            response = await self.ctx.api.call("adapter.napcat.action.call", action_name=action_name, params=params)
         except Exception as exc:
             if raise_on_error:
                 raise
             self.ctx.logger.debug(f"调用 NapCat 动作 {action_name} 失败: {exc}")
             return None
-
         if isinstance(response, dict) and str(response.get("status", "")).lower() not in {"", "ok"}:
             error_text = str(response.get("wording") or response.get("message") or response.get("retcode"))
             if raise_on_error:
@@ -704,7 +312,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             self.ctx.logger.debug(f"NapCat 动作 {action_name} 返回非 ok 状态: {error_text}")
         return response
 
-    # ---------------- 持久化 ----------------
+    # ---- 持久化 ----
 
     def _load_state(self) -> None:
         try:
@@ -722,10 +330,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             self.ctx.logger.warning(f"读取好友申请状态失败: {exc}")
 
     def _save_state(self) -> None:
-        payload = {
-            "pending": self._pending,
-            "notified_flags": sorted(self._notified_flags),
-        }
+        payload = {"pending": self._pending, "notified_flags": sorted(self._notified_flags)}
         try:
             with open(self._data_path, "w", encoding="utf-8") as fp:
                 json.dump(payload, fp, ensure_ascii=False, indent=2)
