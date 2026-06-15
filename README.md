@@ -38,7 +38,7 @@
   * `llm` — LLM 智能审核
   * `auto_approve` — 无条件自动通过
 * `model_name`: LLM 模型名称（仅 `llm` 模式生效），留空使用默认模型。
-* `auto_remark`: LLM 通过后是否自动设置好友备注（仅 `llm` 模式生效），备注内容为对方昵称。
+* `auto_remark`: LLM 通过后是否自动设置好友备注，备注内容为对方昵称，根据所选模型不同，备注会很奇怪，酌情使用。
 
 > 提示词和备注模板如需自定义，请直接修改 `plugin.py` 中的 `_LLM_PROMPT` 和 `_REMARK_TEMPLATE` 常量。
 
