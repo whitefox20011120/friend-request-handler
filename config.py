@@ -102,12 +102,12 @@ class StrategySection(PluginConfigBase):
         },
     )
     model_name: str = Field(
-        default="",
+        default="replyer",
         json_schema_extra={
             "hint": "仅 llm 模式生效。留空使用系统默认模型。",
             "label": "LLM 模型名称",
             "order": 1,
-            "placeholder": "留空使用默认",
+            "placeholder": "replyer",
         },
     )
     auto_remark: bool = Field(
