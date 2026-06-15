@@ -107,10 +107,32 @@ class NoticeSection(PluginConfigBase):
     )
 
 
+class StrategySection(PluginConfigBase):
+    __ui_label__: ClassVar[str] = "申请处理策略"
+    __ui_order__: ClassVar[int] = 3
+
+    mode: str = Field(
+        default="manual",
+        description="好友申请处理策略：manual（手动审批）/ llm（LLM 自动判定）/ auto_approve（无条件自动通过）。",
+        json_schema_extra={"label": "处理策略", "order": 0, "placeholder": "manual"},
+    )
+    model_name: str = Field(
+        default="",
+        description="LLM 模型名称，仅 mode=llm 时生效；留空则使用默认模型。",
+        json_schema_extra={"label": "LLM 模型", "order": 1, "placeholder": "留空使用默认"},
+    )
+    auto_remark: bool = Field(
+        default=True,
+        description="LLM 通过后是否自动设置好友备注，仅 mode=llm 时生效。",
+        json_schema_extra={"label": "自动备注", "order": 2},
+    )
+
+
 class FriendRequestHandlerConfig(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     admin: AdminSection = Field(default_factory=AdminSection)
     webhook: WebhookSection = Field(default_factory=WebhookSection)
+    strategy: StrategySection = Field(default_factory=StrategySection)
     welcome: WelcomeSection = Field(default_factory=WelcomeSection)
     notice: NoticeSection = Field(default_factory=NoticeSection)
 
@@ -128,6 +150,13 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
     # 已经推送过的 flag，避免 NapCat 重复推送
     _notified_flags: set
     _data_path: str
+
+    _LLM_PROMPT = (
+        '你是一个QQ好友申请审核助手。根据以下申请人信息，判断对方是否为正常用户'
+        '（非广告号、非小号、非恶意用户）。如果判断为安全用户请回复"通过"，'
+        '否则回复"拒绝"，只需回复这两个词之一，不要附加其他内容。'
+    )
+    _REMARK_TEMPLATE = "{nickname}"
 
     async def on_load(self) -> None:
         self._runner = None
@@ -236,23 +265,180 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             if not user_id or not flag:
                 return
 
-            admin_qqs = self._normalized_admin_qqs()
-            if not admin_qqs:
-                self.ctx.logger.warning("收到好友申请但未配置 admin_qqs，无法推送")
-                return
-
-            self._pending[user_id] = {"flag": flag, "comment": comment, "nickname": ""}
             if flag in self._notified_flags:
                 return
             self._notified_flags.add(flag)
-            self._save_state()
 
-            notice_text = await self._build_notice_text(user_id, "", comment)
-            for admin_qq in admin_qqs:
-                await self._send_private_notice(admin_qq, user_id, notice_text)
-            self.ctx.logger.info(f"已推送好友申请: user_id={user_id} flag={flag}")
+            mode = (self.config.strategy.mode or "manual").strip().lower()
+
+            if mode == "llm":
+                await self._handle_llm_decision(user_id, flag, comment)
+            elif mode == "auto_approve":
+                await self._handle_auto_approve(user_id, flag, comment)
+            else:
+                await self._handle_manual(user_id, flag, comment)
+
+            self._save_state()
         except Exception as exc:
             self.ctx.logger.warning(f"处理好友申请失败: {exc}")
+
+    async def _handle_manual(self, user_id: str, flag: str, comment: str) -> None:
+        admin_qqs = self._normalized_admin_qqs()
+        if not admin_qqs:
+            self.ctx.logger.warning("收到好友申请但未配置 admin_qqs，无法推送")
+            return
+
+        self._pending[user_id] = {"flag": flag, "comment": comment, "nickname": ""}
+
+        notice_text = await self._build_notice_text(user_id, "", comment)
+        for admin_qq in admin_qqs:
+            await self._send_private_notice(admin_qq, user_id, notice_text)
+        self.ctx.logger.info(f"已推送好友申请: user_id={user_id} flag={flag}")
+
+    async def _handle_llm_decision(self, user_id: str, flag: str, comment: str) -> None:
+        info_text = await self._build_applicant_info_text(user_id, comment)
+        full_prompt = f"{self._LLM_PROMPT}\n\n申请人信息：\n{info_text}"
+
+        ok, reply = await self._call_llm(full_prompt)
+        if not ok:
+            self.ctx.logger.warning(f"LLM 调用失败，回退到手动模式: user_id={user_id}")
+            await self._handle_manual(user_id, flag, comment)
+            return
+
+        approved = "通过" in reply
+        await self._call_napcat(
+            "set_friend_add_request",
+            {"flag": flag, "approve": approved},
+            raise_on_error=False,
+        )
+
+        if approved:
+            self.ctx.logger.info(f"LLM 判定通过好友申请: user_id={user_id}")
+            if self.config.strategy.auto_remark:
+                nickname = await self._get_nickname(user_id)
+                remark = self._REMARK_TEMPLATE.replace("{nickname}", nickname)
+                if remark:
+                    await asyncio.sleep(0.5)
+                    try:
+                        await self._call_napcat(
+                            "set_friend_remark",
+                            {"user_id": int(user_id), "remark": remark},
+                            raise_on_error=False,
+                        )
+                    except Exception as exc:
+                        self.ctx.logger.warning(f"设置好友备注失败: {exc}")
+            await self._send_welcome(user_id)
+        else:
+            self.ctx.logger.info(f"LLM 判定拒绝好友申请: user_id={user_id}")
+
+    async def _handle_auto_approve(self, user_id: str, flag: str, comment: str) -> None:
+        await self._call_napcat(
+            "set_friend_add_request",
+            {"flag": flag, "approve": True},
+            raise_on_error=False,
+        )
+        self.ctx.logger.info(f"自动通过好友申请: user_id={user_id}")
+
+        admin_qqs = self._normalized_admin_qqs()
+        if admin_qqs:
+            info_text = await self._build_info_only_text(user_id, comment)
+            for admin_qq in admin_qqs:
+                await self._send_private_notice(admin_qq, user_id, info_text)
+
+        await self._send_welcome(user_id)
+
+    # ---------------- LLM / 自动策略辅助 ----------------
+
+    async def _call_llm(self, prompt: str) -> tuple[bool, str]:
+        model_name = (self.config.strategy.model_name or "").strip()
+        try:
+            kwargs: Dict[str, Any] = {"prompt": prompt, "temperature": 0.3, "max_tokens": 64}
+            if model_name:
+                kwargs["model"] = model_name
+            result = await self.ctx.llm.generate(**kwargs)
+        except Exception as e:
+            self.ctx.logger.error(f"LLM 调用异常: {e}", exc_info=True)
+            return False, ""
+        if not isinstance(result, dict) or not result.get("success"):
+            self.ctx.logger.warning(f"LLM 返回失败: {result}")
+            return False, ""
+        return True, str(result.get("response", "")).strip()
+
+    async def _get_nickname(self, user_id: str) -> str:
+        info = await self._call_napcat(
+            "get_stranger_info",
+            {"user_id": int(user_id) if user_id.isdigit() else user_id, "no_cache": True},
+        )
+        info_data = info.get("data", info) if isinstance(info, dict) else {}
+        if not isinstance(info_data, dict):
+            return ""
+        return str(info_data.get("nickname") or "").strip()
+
+    async def _send_welcome(self, user_id: str) -> None:
+        await asyncio.sleep(1.0)
+        messages = [m.strip() for m in (self.config.welcome.messages or []) if m.strip()]
+        for i, msg in enumerate(messages):
+            try:
+                await self._send_private_text(user_id, msg)
+            except Exception as exc:
+                self.ctx.logger.warning(f"发送欢迎语失败: {exc}")
+            if i < len(messages) - 1:
+                await asyncio.sleep(0.5)
+
+    async def _build_applicant_info_text(self, user_id: str, comment: str) -> str:
+        info = await self._call_napcat(
+            "get_stranger_info",
+            {"user_id": int(user_id) if user_id.isdigit() else user_id, "no_cache": True},
+        )
+        info_data = info.get("data", info) if isinstance(info, dict) else {}
+        if not isinstance(info_data, dict):
+            info_data = {}
+
+        lines: List[str] = []
+
+        def add(label: str, value: Any) -> None:
+            text = "" if value is None else str(value).strip()
+            if not text or text in {"0", "0.0", "unknown"}:
+                return
+            lines.append(f"{label}: {text}")
+
+        add("QQ号", user_id)
+        add("昵称", info_data.get("nickname"))
+        add("性别", self._format_sex(info_data.get("sex")))
+        add("年龄", info_data.get("age"))
+        add("等级", info_data.get("level") or info_data.get("qqLevel"))
+        add("个性签名", info_data.get("long_nick") or info_data.get("longNick") or info_data.get("sign"))
+        add("登录天数", info_data.get("login_days") or info_data.get("loginDays"))
+        if comment:
+            lines.append(f"验证消息: {comment}")
+        return "\n".join(lines)
+
+    async def _build_info_only_text(self, user_id: str, comment: str) -> str:
+        info = await self._call_napcat(
+            "get_stranger_info",
+            {"user_id": int(user_id) if user_id.isdigit() else user_id, "no_cache": True},
+        )
+        info_data = info.get("data", info) if isinstance(info, dict) else {}
+        if not isinstance(info_data, dict):
+            info_data = {}
+
+        lines: List[str] = ["✅ 已自动通过好友申请"]
+
+        def add(label: str, value: Any) -> None:
+            text = "" if value is None else str(value).strip()
+            if not text or text in {"0", "0.0", "unknown"}:
+                return
+            lines.append(f"{label}: {text}")
+
+        add("QQ号", user_id)
+        add("昵称", info_data.get("nickname"))
+        add("性别", self._format_sex(info_data.get("sex")))
+        add("年龄", info_data.get("age"))
+        add("等级", info_data.get("level") or info_data.get("qqLevel"))
+        add("个性签名", info_data.get("long_nick") or info_data.get("longNick") or info_data.get("sign"))
+        if comment:
+            lines.append(f"验证消息: {comment}")
+        return "\n".join(lines)
 
     # ---------------- 资料组装 ----------------
 
