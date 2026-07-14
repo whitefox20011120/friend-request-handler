@@ -1,4 +1,4 @@
-"""好友申请处理插件 — 配置模型。"""
+"""好友申请处理插件（SnowLuma 适配版） — 配置模型。"""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ class PluginSection(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="1.2.0",
+        default="1.3.0",
         json_schema_extra={"disabled": True, "hidden": True, "label": "配置版本", "order": 99},
     )
 
@@ -42,44 +42,53 @@ class AdminSection(PluginConfigBase):
     )
 
 
-class WebhookSection(PluginConfigBase):
-    __ui_label__: ClassVar[str] = "Webhook 监听"
+class SnowLumaSection(PluginConfigBase):
+    __ui_label__: ClassVar[str] = "SnowLuma 连接"
     __ui_order__: ClassVar[int] = 2
 
-    host: str = Field(
+    server: str = Field(
         default="127.0.0.1",
         json_schema_extra={
-            "hint": "监听 NapCat HTTP 上报的本地地址，同机填 127.0.0.1 即可。",
-            "label": "监听地址",
+            "hint": "SnowLuma WebSocket 服务地址；与 SnowLuma 适配器插件同一配置即可。",
+            "label": "服务地址",
             "order": 0,
             "placeholder": "127.0.0.1",
         },
     )
     port: int = Field(
-        default=18080, ge=1, le=65535,
+        default=3001, ge=1, le=65535,
         json_schema_extra={
-            "hint": "监听端口，需与 NapCat HTTP 客户端配置中的端口一致。",
-            "label": "监听端口",
+            "hint": "SnowLuma WebSocket 服务端口。",
+            "label": "端口",
             "order": 1,
             "step": 1,
         },
     )
-    path: str = Field(
-        default="/maibot/friend_request",
-        json_schema_extra={
-            "hint": "HTTP 路径，NapCat 的 URL 应填 http://host:port/path。",
-            "label": "HTTP 路径",
-            "order": 2,
-            "placeholder": "/maibot/friend_request",
-        },
-    )
-    secret: str = Field(
+    token: str = Field(
         default="",
         json_schema_extra={
-            "hint": "可选，对应 NapCat HTTP 客户端的 token，留空则不校验签名。",
-            "label": "Secret",
-            "order": 3,
+            "hint": "如果 SnowLuma 开启了 access_token 校验请填写；未开启留空。",
+            "label": "访问令牌",
+            "order": 2,
             "input_type": "password",
+        },
+    )
+    reconnect_delay_sec: float = Field(
+        default=5.0, ge=1.0, le=60.0,
+        json_schema_extra={
+            "hint": "断线后等待多少秒再重连。",
+            "label": "重连等待(秒)",
+            "order": 3,
+            "step": 1,
+        },
+    )
+    action_timeout_sec: float = Field(
+        default=10.0, ge=1.0, le=60.0,
+        json_schema_extra={
+            "hint": "调用 SnowLuma OneBot 动作的超时时间。",
+            "label": "动作超时(秒)",
+            "order": 4,
+            "step": 1,
         },
     )
 
@@ -161,7 +170,7 @@ class NoticeSection(PluginConfigBase):
 class FriendRequestHandlerConfig(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     admin: AdminSection = Field(default_factory=AdminSection)
-    webhook: WebhookSection = Field(default_factory=WebhookSection)
+    snowluma: SnowLumaSection = Field(default_factory=SnowLumaSection)
     strategy: StrategySection = Field(default_factory=StrategySection)
     welcome: WelcomeSection = Field(default_factory=WelcomeSection)
     notice: NoticeSection = Field(default_factory=NoticeSection)

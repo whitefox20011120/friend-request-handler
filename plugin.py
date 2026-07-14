@@ -1,5 +1,9 @@
 """
-好友申请处理插件。
+好友申请处理插件（SnowLuma 适配版）。
+
+原版通过 NapCat HTTP 上报（webhook）接收好友申请，本版通过独立 WebSocket
+直连 SnowLuma 服务端接收 OneBot v11 事件并调用动作接口。
+
 by：白狐 & claude
 """
 
@@ -7,14 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hmac
 import json
 import os
-from hashlib import sha1
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
+from uuid import uuid4
 
 import aiohttp
-from aiohttp import web
+from aiohttp import ClientSession, ClientTimeout, ClientWebSocketResponse, WSMsgType
 
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, MaiBotPlugin
 
@@ -25,15 +29,21 @@ from .handlers import handle_auto_approve, handle_llm_decision, handle_manual
 class FriendRequestHandlerPlugin(MaiBotPlugin):
     config_model = FriendRequestHandlerConfig
 
-    _runner: Optional[web.AppRunner]
-    _site: Optional[web.BaseSite]
+    _session: Optional[ClientSession]
+    _ws: Optional[ClientWebSocketResponse]
+    _connection_task: Optional[asyncio.Task]
+    _stop_event: Optional[asyncio.Event]
+    _response_pool: Dict[str, asyncio.Future]
     _pending: Dict[str, Dict[str, Any]]
     _notified_flags: set
     _data_path: str
 
     async def on_load(self) -> None:
-        self._runner = None
-        self._site = None
+        self._session = None
+        self._ws = None
+        self._connection_task = None
+        self._stop_event = None
+        self._response_pool = {}
         self._pending = {}
         self._notified_flags = set()
 
@@ -43,84 +53,131 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         self._load_state()
 
         if self.config.plugin.enabled:
-            await self._start_webhook()
-        self.ctx.logger.info("好友申请处理插件已加载")
+            await self._start_connection()
+        self.ctx.logger.info("好友申请处理插件（SnowLuma）已加载")
 
     async def on_unload(self) -> None:
-        await self._stop_webhook()
+        await self._stop_connection()
         self._save_state()
 
     async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
         del config_data, version
-        await self._stop_webhook()
+        await self._stop_connection()
         if self.config.plugin.enabled:
-            await self._start_webhook()
+            await self._start_connection()
 
-    # ---- Webhook 服务 ----
+    # ---- SnowLuma WebSocket 连接 ----
 
-    async def _start_webhook(self) -> None:
-        webhook = self.config.webhook
-        path = webhook.path if webhook.path.startswith("/") else f"/{webhook.path}"
+    def _build_ws_url(self) -> str:
+        cfg = self.config.snowluma
+        base_url = f"ws://{cfg.server}:{int(cfg.port)}"
+        token = (cfg.token or "").strip()
+        if not token:
+            return base_url
+        return f"{base_url}?{urlencode({'access_token': token})}"
 
-        app = web.Application()
-        app.router.add_post(path, self._handle_webhook)
+    async def _start_connection(self) -> None:
+        self._stop_event = asyncio.Event()
+        self._connection_task = asyncio.create_task(
+            self._run_connection_loop(), name="friend-request-snowluma-loop"
+        )
+        self.ctx.logger.info(f"好友申请 SnowLuma WebSocket 连接任务已启动: {self._build_ws_url()}")
 
-        self._runner = web.AppRunner(app)
-        await self._runner.setup()
+    async def _stop_connection(self) -> None:
+        if self._stop_event is not None:
+            self._stop_event.set()
+        task = self._connection_task
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                self.ctx.logger.warning(f"关闭 SnowLuma 连接任务出错: {exc}")
+            self._connection_task = None
+        await self._disconnect()
+        self._stop_event = None
+
+    async def _run_connection_loop(self) -> None:
+        while self._stop_event is not None and not self._stop_event.is_set():
+            reconnect_delay = max(1.0, float(self.config.snowluma.reconnect_delay_sec))
+            try:
+                await self._connect()
+                await self._listen()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.ctx.logger.warning(f"SnowLuma 连接异常，稍后重试: {exc}")
+            finally:
+                await self._disconnect()
+
+            if self._stop_event is None or self._stop_event.is_set():
+                break
+            try:
+                await asyncio.sleep(reconnect_delay)
+            except asyncio.CancelledError:
+                raise
+
+    async def _connect(self) -> None:
+        timeout = ClientTimeout(total=10)
+        self._session = ClientSession(timeout=timeout)
+        self._ws = await self._session.ws_connect(self._build_ws_url())
+        self.ctx.logger.info(f"好友申请 SnowLuma WebSocket 已连接: {self._build_ws_url()}")
+
+    async def _disconnect(self) -> None:
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        if self._session is not None:
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+            self._session = None
+        for future in self._response_pool.values():
+            if not future.done():
+                future.cancel()
+        self._response_pool.clear()
+
+    async def _listen(self) -> None:
+        if self._ws is None:
+            return
+        async for ws_message in self._ws:
+            if ws_message.type == WSMsgType.TEXT:
+                await self._handle_text_payload(ws_message.data)
+                continue
+            if ws_message.type == WSMsgType.BINARY:
+                self.ctx.logger.debug("SnowLuma 收到二进制消息，已忽略")
+                continue
+            if ws_message.type in {WSMsgType.CLOSED, WSMsgType.ERROR}:
+                break
+
+    async def _handle_text_payload(self, raw_payload: str) -> None:
         try:
-            self._site = web.TCPSite(self._runner, webhook.host, int(webhook.port))
-            await self._site.start()
-        except OSError as exc:
-            self.ctx.logger.error(
-                f"好友申请 webhook 监听失败 host={webhook.host} port={webhook.port}: {exc}"
-            )
-            await self._stop_webhook()
+            payload = json.loads(raw_payload)
+        except json.JSONDecodeError:
+            self.ctx.logger.warning(f"SnowLuma 收到非 JSON 文本: {raw_payload[:120]}")
+            return
+        if not isinstance(payload, dict):
             return
 
-        self.ctx.logger.info(f"好友申请 webhook 已监听: http://{webhook.host}:{webhook.port}{path}")
-
-    async def _stop_webhook(self) -> None:
-        site, runner = self._site, self._runner
-        self._site = self._runner = None
-        try:
-            if site is not None:
-                await site.stop()
-        except Exception as exc:
-            self.ctx.logger.warning(f"停止 webhook 监听失败: {exc}")
-        try:
-            if runner is not None:
-                await runner.cleanup()
-        except Exception as exc:
-            self.ctx.logger.warning(f"清理 webhook 资源失败: {exc}")
-
-    async def _handle_webhook(self, request: web.Request) -> web.Response:
-        raw = await request.read()
-        if not self._verify_signature(request, raw):
-            return web.Response(status=401, text="invalid signature")
-        try:
-            payload = json.loads(raw.decode("utf-8") or "{}")
-        except Exception:
-            return web.Response(status=400, text="invalid json")
-        if not isinstance(payload, dict):
-            return web.Response(status=400, text="invalid payload")
+        echo = str(payload.get("echo") or "").strip()
+        if echo:
+            future = self._response_pool.pop(echo, None)
+            if future is not None and not future.done():
+                future.set_result(payload)
+            return
 
         post_type = str(payload.get("post_type") or "").strip()
         request_type = str(payload.get("request_type") or "").strip()
         if post_type == "request" and request_type == "friend":
             asyncio.create_task(self._on_friend_request(payload))
-        return web.json_response({})
-
-    def _verify_signature(self, request: web.Request, raw: bytes) -> bool:
-        secret = (self.config.webhook.secret or "").strip()
-        if not secret:
-            return True
-        signature = request.headers.get("X-Signature", "")
-        if not signature.startswith("sha1="):
-            return False
-        expected = "sha1=" + hmac.new(secret.encode("utf-8"), raw, sha1).hexdigest()
-        return hmac.compare_digest(signature, expected)
 
     # ---- 申请分流 ----
 
@@ -165,8 +222,6 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
     async def handle_reject(self, stream_id: str = "", **kwargs: Any) -> tuple:
         return await self._handle_decision(approve=False, stream_id=stream_id, **kwargs)
 
-    # --- PLACEHOLDER_DECISION ---
-
     async def _handle_decision(self, approve: bool, stream_id: str, **kwargs: Any) -> tuple:
         if self._is_group_context(kwargs):
             return False, None, False
@@ -181,7 +236,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
 
         record = self._pending.get(target_qq)
         if record is None:
-            await self._reply(stream_id, f"未找到 QQ {target_qq} 的好友申请，可能已经处理过或 webhook 未收到。")
+            await self._reply(stream_id, f"未找到 QQ {target_qq} 的好友申请，可能已经处理过或 SnowLuma 未推送。")
             return True, None, True
 
         flag = record.get("flag", "")
@@ -192,7 +247,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             params["remark"] = remark
 
         try:
-            await self._call_napcat("set_friend_add_request", params, raise_on_error=True)
+            await self._call_snowluma("set_friend_add_request", params, raise_on_error=True)
         except Exception as exc:
             await self._reply(stream_id, f"处理失败：{exc}")
             return False, None, True
@@ -205,7 +260,11 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             if remark:
                 await asyncio.sleep(0.5)
                 try:
-                    await self._call_napcat("set_friend_remark", {"user_id": int(target_qq), "remark": remark}, raise_on_error=False)
+                    await self._call_snowluma(
+                        "set_friend_remark",
+                        {"user_id": int(target_qq), "remark": remark},
+                        raise_on_error=False,
+                    )
                 except Exception as exc:
                     self.ctx.logger.warning(f"设置好友备注失败: {exc}")
             await asyncio.sleep(1.0)
@@ -254,9 +313,12 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
     async def _send_private_text(self, user_id: str, text: str) -> None:
         if not user_id or not text:
             return
-        await self._call_napcat(
+        await self._call_snowluma(
             "send_private_msg",
-            {"user_id": int(user_id) if str(user_id).isdigit() else user_id, "message": [{"type": "text", "data": {"text": text}}]},
+            {
+                "user_id": int(user_id) if str(user_id).isdigit() else user_id,
+                "message": [{"type": "text", "data": {"text": text}}],
+            },
             raise_on_error=False,
         )
 
@@ -270,9 +332,12 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             if avatar_b64:
                 message.append({"type": "image", "data": {"file": f"base64://{avatar_b64}"}})
         message.append({"type": "text", "data": {"text": text}})
-        await self._call_napcat(
+        await self._call_snowluma(
             "send_private_msg",
-            {"user_id": int(admin_qq) if str(admin_qq).isdigit() else admin_qq, "message": message},
+            {
+                "user_id": int(admin_qq) if str(admin_qq).isdigit() else admin_qq,
+                "message": message,
+            },
             raise_on_error=False,
         )
 
@@ -297,19 +362,62 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             self.ctx.logger.warning(f"头像下载会话错误: {exc}")
         return None
 
-    async def _call_napcat(self, action_name: str, params: Dict[str, Any], raise_on_error: bool = False) -> Any:
+    # ---- OneBot 动作调用（直接走 SnowLuma WebSocket） ----
+
+    async def _call_snowluma(
+        self,
+        action_name: str,
+        params: Dict[str, Any],
+        raise_on_error: bool = False,
+    ) -> Any:
+        if self._ws is None:
+            if raise_on_error:
+                raise RuntimeError("SnowLuma WebSocket 尚未连接")
+            self.ctx.logger.debug(f"SnowLuma WebSocket 尚未连接，跳过动作 {action_name}")
+            return None
+
+        echo = uuid4().hex
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._response_pool[echo] = future
+        payload = {"action": action_name, "params": params, "echo": echo}
         try:
-            response = await self.ctx.api.call("adapter.napcat.action.call", action_name=action_name, params=params)
+            await self._ws.send_str(json.dumps(payload, ensure_ascii=False))
+        except Exception as exc:
+            self._response_pool.pop(echo, None)
+            if raise_on_error:
+                raise
+            self.ctx.logger.debug(f"发送 SnowLuma 动作 {action_name} 失败: {exc}")
+            return None
+
+        timeout = max(1.0, float(self.config.snowluma.action_timeout_sec))
+        try:
+            response = await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            self.ctx.logger.warning(f"SnowLuma 动作 {action_name} 响应超时({timeout:.1f}s)")
+            if raise_on_error:
+                raise RuntimeError(f"SnowLuma 动作 {action_name} 响应超时")
+            return None
         except Exception as exc:
             if raise_on_error:
                 raise
-            self.ctx.logger.debug(f"调用 NapCat 动作 {action_name} 失败: {exc}")
+            self.ctx.logger.debug(f"等待 SnowLuma 动作 {action_name} 响应异常: {exc}")
             return None
-        if isinstance(response, dict) and str(response.get("status", "")).lower() not in {"", "ok"}:
-            error_text = str(response.get("wording") or response.get("message") or response.get("retcode"))
-            if raise_on_error:
-                raise RuntimeError(f"NapCat 动作 {action_name} 返回错误: {error_text}")
-            self.ctx.logger.debug(f"NapCat 动作 {action_name} 返回非 ok 状态: {error_text}")
+        finally:
+            self._response_pool.pop(echo, None)
+
+        if isinstance(response, dict):
+            status = str(response.get("status", "")).lower()
+            retcode = response.get("retcode")
+            has_error = (status and status not in {"", "ok"}) or (
+                isinstance(retcode, int) and retcode not in {0, 1}
+            )
+            if has_error:
+                error_text = str(
+                    response.get("wording") or response.get("message") or retcode
+                )
+                if raise_on_error:
+                    raise RuntimeError(f"SnowLuma 动作 {action_name} 返回错误: {error_text}")
+                self.ctx.logger.debug(f"SnowLuma 动作 {action_name} 返回非 ok 状态: {error_text}")
         return response
 
     # ---- 持久化 ----

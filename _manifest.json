@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "version": "1.3.0",
-  "name": "好友申请处理",
-  "description": "监听加好友申请，支持手动审批、LLM 智能审核、无条件自动通过三种策略",
+  "name": "好友申请处理 (SnowLuma)",
+  "description": "SnowLuma 适配版：通过 WebSocket 直连 SnowLuma 监听加好友申请，支持手动审批、LLM 智能审核、无条件自动通过三种策略",
   "author": {
     "name": "白狐",
     "url": "https://github.com/whitefox20011120"
@@ -39,7 +39,7 @@
       "zh-CN"
     ]
   },
-  "id": "whitefox.friend-request-handler",
+  "id": "whitefox.friend-request-handler-snowluma",
   "plugin_type": "management",
   "display": {
     "icon": {

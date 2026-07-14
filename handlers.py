@@ -1,4 +1,4 @@
-"""好友申请处理插件 — 策略处理器。"""
+"""好友申请处理插件（SnowLuma 适配版） — 策略处理器。"""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ async def handle_llm_decision(plugin: "FriendRequestHandlerPlugin", user_id: str
         return
 
     approved = "通过" in reply
-    await plugin._call_napcat(
+    await plugin._call_snowluma(
         "set_friend_add_request",
         {"flag": flag, "approve": approved},
         raise_on_error=False,
@@ -61,7 +61,7 @@ async def handle_llm_decision(plugin: "FriendRequestHandlerPlugin", user_id: str
             if remark:
                 await asyncio.sleep(0.5)
                 try:
-                    await plugin._call_napcat(
+                    await plugin._call_snowluma(
                         "set_friend_remark",
                         {"user_id": int(user_id), "remark": remark},
                         raise_on_error=False,
@@ -75,7 +75,7 @@ async def handle_llm_decision(plugin: "FriendRequestHandlerPlugin", user_id: str
 
 
 async def handle_auto_approve(plugin: "FriendRequestHandlerPlugin", user_id: str, flag: str, comment: str) -> None:
-    await plugin._call_napcat(
+    await plugin._call_snowluma(
         "set_friend_add_request",
         {"flag": flag, "approve": True},
         raise_on_error=False,
@@ -122,7 +122,7 @@ async def _generate_remark(plugin: "FriendRequestHandlerPlugin", info_text: str)
 
 
 async def _get_nickname(plugin: "FriendRequestHandlerPlugin", user_id: str) -> str:
-    info = await plugin._call_napcat(
+    info = await plugin._call_snowluma(
         "get_stranger_info",
         {"user_id": int(user_id) if user_id.isdigit() else user_id, "no_cache": True},
     )
@@ -150,7 +150,7 @@ def _format_sex(value: Any) -> str:
 
 
 async def _build_applicant_info_text(plugin: "FriendRequestHandlerPlugin", user_id: str, comment: str) -> str:
-    info = await plugin._call_napcat(
+    info = await plugin._call_snowluma(
         "get_stranger_info",
         {"user_id": int(user_id) if user_id.isdigit() else user_id, "no_cache": True},
     )
@@ -179,7 +179,7 @@ async def _build_applicant_info_text(plugin: "FriendRequestHandlerPlugin", user_
 
 
 async def _build_info_only_text(plugin: "FriendRequestHandlerPlugin", user_id: str, comment: str) -> str:
-    info = await plugin._call_napcat(
+    info = await plugin._call_snowluma(
         "get_stranger_info",
         {"user_id": int(user_id) if user_id.isdigit() else user_id, "no_cache": True},
     )
@@ -207,7 +207,7 @@ async def _build_info_only_text(plugin: "FriendRequestHandlerPlugin", user_id: s
 
 
 async def build_notice_text(plugin: "FriendRequestHandlerPlugin", user_id: str, fallback_nickname: str, comment: str) -> str:
-    info = await plugin._call_napcat(
+    info = await plugin._call_snowluma(
         "get_stranger_info",
         {"user_id": int(user_id) if user_id.isdigit() else user_id, "no_cache": True},
     )

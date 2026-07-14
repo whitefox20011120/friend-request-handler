@@ -1,0 +1,40 @@
+[plugin]
+enabled = true
+config_version = "1.3.0"
+
+[admin]
+# 管理员 QQ 号列表；仅这些 QQ 发送 /同意 /拒绝 命令时会被执行，也是新申请的接收者
+admin_qqs = []
+
+[snowluma]
+# SnowLuma WebSocket 服务地址；与 MaiBot-SnowLuma-Adapter 的 luma_client 配置保持一致
+server = "127.0.0.1"
+# SnowLuma WebSocket 端口
+port = 3001
+# 若 SnowLuma 开启了 access_token 校验请填写，未开启留空
+token = ""
+# 断线重连等待秒数
+reconnect_delay_sec = 5.0
+# OneBot 动作超时（秒）
+action_timeout_sec = 10.0
+
+[strategy]
+# 好友申请处理策略: manual（手动审批）/ llm（LLM 自动判定）/ auto_approve（无条件自动通过）
+mode = "manual"
+# LLM 模型名称，仅 mode = "llm" 时生效；留空使用默认模型
+model_name = "replyer"
+# LLM 通过后是否自动设置好友备注（仅 mode = "llm" 时生效）
+auto_remark = true
+
+[welcome]
+# 通过申请后自动私聊给新好友的欢迎语，按顺序逐条发送，每条间隔 0.5 秒
+messages = [
+    "你好呀新朋友！\n很高兴认识你~",
+    "今天有没有什么开心的事呀~",
+]
+
+[notice]
+# 推送好友申请通知时，是否在文本上方附带申请方的 QQ 头像
+send_avatar = true
+# 头像尺寸（像素），常用值: 100 / 140 / 640
+avatar_size = 640
