@@ -1,4 +1,4 @@
-# MaiSaka 好友申请处理插件 (Friend Request Handler)
+# MaiSaka 好友申请处理插件 (snowluma)
 
 > QQ 好友申请自动化处理插件。它可以将接收到的新好友申请推送到指定的管理员 QQ，并允许管理员直接在私聊中快捷同意或拒绝。
 > 有问题请提issue
