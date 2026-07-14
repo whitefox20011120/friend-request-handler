@@ -26,10 +26,14 @@
 
 
 * **监听设置** 
-* `host`: 监听地址，默认 `127.0.0.1`。
-* `port`: 监听端口，默认 `18080`。
-* `path`: 监听路径，默认 `/maibot/friend_request`。
-* `secret`: 签名密钥（可选）。
+```toml
+[snowluma]
+server = "127.0.0.1"   # 与 SnowLuma 适配器的 luma_client.server 保持一致
+port = 3001            # 与 luma_client.port 保持一致
+token = ""             # 若 SnowLuma 开启了 access_token，请填相同值
+reconnect_delay_sec = 5.0
+action_timeout_sec = 10.0
+```
 
 
 * **申请处理策略**
