@@ -13,6 +13,7 @@ import asyncio
 import base64
 import json
 import os
+import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 from uuid import uuid4
@@ -179,6 +180,44 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         if post_type == "request" and request_type == "friend":
             asyncio.create_task(self._on_friend_request(payload))
 
+    async def _notify_unresolved(self, *, flag: str, comment: str, nickname: str, payload: Dict[str, Any]) -> None:
+        """上游没给出 QQ 号的好友申请：记日志 + 推给管理员，别让它静默消失。"""
+
+        brief = json.dumps(
+            {k: payload.get(k) for k in ("post_type", "request_type", "user_id", "flag", "comment", "nickname", "uid", "sub_type") if k in payload},
+            ensure_ascii=False,
+        )
+        self.ctx.logger.warning(
+            "好友申请没有 QQ 号，需要手动处理: flag=%s nickname=%s comment=%s raw=%s"
+            % (flag or "<空>", nickname or "<空>", comment or "<空>", brief[:400])
+        )
+        # 上游只给了内部 uid 时，flag 是唯一能用来批准的凭据：
+        # set_friend_add_request 只需要 flag，不需要 QQ 号。所以这里也记一条待处理，
+        # 让 "/同意 <内部标识>" 能处理它，否则连人工补救都会报“未找到”。
+        # 注意：必须放在下面 120 秒冷却检查【之前】，否则连发时第二条会漏记。
+        if flag and flag not in self._notified_flags:
+            self._notified_flags.add(flag)
+            self._pending[flag] = {
+                "flag": flag,
+                "comment": comment,
+                "nickname": nickname,
+                "unresolved": True,
+            }
+            self._save_state()
+        now = time.time()
+        if now - float(getattr(self, "_unresolved_notified_at", 0.0)) < 120:
+            return
+        self._unresolved_notified_at = now
+        text = (
+            "有一条好友申请没有 QQ 号（上游只知道对方的内部标识）。\n"
+            "验证消息：%s\n内部标识：%s\n原始字段：%s\n"
+            "→ 方式一：直接在 QQ 客户端上通过或忽略。\n"
+            "→ 方式二：把下面的「内部标识」原样发给我，例：/同意 %s"
+            % (comment or nickname or "（空）", flag or "（空）", brief, flag or "（空）")
+        )
+        for admin in (self.config.admin.admin_qqs or []):
+            await self._send_private_text(str(admin), text)
+
     # ---- 申请分流 ----
 
     async def _on_friend_request(self, payload: Dict[str, Any]) -> None:
@@ -186,7 +225,14 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
             user_id = str(payload.get("user_id") or "").strip()
             flag = str(payload.get("flag") or "").strip()
             comment = str(payload.get("comment") or "").strip()
-            if not user_id or not flag:
+            nickname = str(payload.get("nickname") or "").strip()
+            if user_id in ("", "0"):
+                # 上游没解析出 QQ 号时会给出空值/0。原来这里直接 return，申请就静默消失了，
+                # 管理员既收不到通知、也没法用 /同意 补救。现在改成记录 + 通知。
+                await self._notify_unresolved(flag=flag, comment=comment, nickname=nickname, payload=payload)
+                return
+            if not flag:
+                self.ctx.logger.warning("好友申请缺少 flag，已跳过")
                 return
             if flag in self._notified_flags:
                 return
@@ -209,7 +255,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
     @Command(
         "approve_friend",
         description="管理员同意指定 QQ 的好友申请，可附带备注",
-        pattern=r"^/同意\s+(?P<target_qq>\d+)(?:\s+(?P<remark>.+?))?\s*$",
+        pattern=r"^/同意\s+(?P<target_qq>[\w-]+)(?:\s+(?P<remark>.+?))?\s*$",
     )
     async def handle_approve(self, stream_id: str = "", **kwargs: Any) -> tuple:
         return await self._handle_decision(approve=True, stream_id=stream_id, **kwargs)
@@ -217,7 +263,7 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
     @Command(
         "reject_friend",
         description="管理员拒绝指定 QQ 的好友申请",
-        pattern=r"^/拒绝\s+(?P<target_qq>\d+)\s*$",
+        pattern=r"^/拒绝\s+(?P<target_qq>[\w-]+)\s*$",
     )
     async def handle_reject(self, stream_id: str = "", **kwargs: Any) -> tuple:
         return await self._handle_decision(approve=False, stream_id=stream_id, **kwargs)
@@ -256,8 +302,13 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
         self._notified_flags.discard(flag)
         self._save_state()
 
+        # target_qq 可能是真 QQ 号，也可能是上游给的内部标识（没解析出 QQ 号那条路）。
+        # 设置备注和发私聊都必须要真 QQ 号，内部标识时跳过并记日志，别让 int() 抛异常。
+        is_real_qq = target_qq.isdigit()
+        target_label = f"QQ {target_qq}" if is_real_qq else f"内部标识 {target_qq}"
+
         if approve:
-            if remark:
+            if remark and is_real_qq:
                 await asyncio.sleep(0.5)
                 try:
                     await self._call_snowluma(
@@ -267,17 +318,22 @@ class FriendRequestHandlerPlugin(MaiBotPlugin):
                     )
                 except Exception as exc:
                     self.ctx.logger.warning(f"设置好友备注失败: {exc}")
-            await asyncio.sleep(1.0)
-            for msg in [m.strip() for m in (self.config.welcome.messages or []) if m.strip()]:
-                try:
-                    await self._send_private_text(target_qq, msg)
-                except Exception as exc:
-                    self.ctx.logger.warning(f"发送欢迎语失败: {exc}")
-                await asyncio.sleep(0.5)
+            elif remark:
+                self.ctx.logger.info(f"目标 {target_qq} 是内部标识不是 QQ 号，已跳过设置备注")
+            if is_real_qq:
+                await asyncio.sleep(1.0)
+                for msg in [m.strip() for m in (self.config.welcome.messages or []) if m.strip()]:
+                    try:
+                        await self._send_private_text(target_qq, msg)
+                    except Exception as exc:
+                        self.ctx.logger.warning(f"发送欢迎语失败: {exc}")
+                    await asyncio.sleep(0.5)
+            else:
+                self.ctx.logger.info(f"目标 {target_qq} 是内部标识，已跳过发送欢迎语")
             remark_tip = f"（备注: {remark}）" if remark else ""
-            await self._reply(stream_id, f"已同意 QQ {target_qq} 的好友申请。{remark_tip}")
+            await self._reply(stream_id, f"已同意 {target_label} 的好友申请。{remark_tip}")
         else:
-            await self._reply(stream_id, f"已拒绝 QQ {target_qq} 的好友申请。")
+            await self._reply(stream_id, f"已拒绝 {target_label} 的好友申请。")
         return True, None, True
 
     # ---- 工具方法 ----
